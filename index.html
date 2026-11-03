@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grade Mate</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="apple-touch-icon" sizes="180x180" href="path-to-your-icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="path-to-your-icons/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="path-to-your-icons/favicon-16x16.png">
+  <link rel="manifest" href="path-to-your-icons/site.webmanifest">
+
+  <!-- JSZip for handling ZIP files -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🏅 Grade Mate</div>
+    <div class="actions" id="actions" hidden>
+      <button id="addFilesBtn" class="btn ghost">📂 Load files</button>
+      <button id="oneAllBtn" class="btn">✅ 1 to all handed in</button>
+      <button id="zeroMissingBtn" class="btn">❌ 0 to all missing</button>
+      <button id="saveBtn" class="btn primary">💾 Download CSV</button>
+    </div>
+  </header>
+
+  <input type="file" id="fileInput" accept=".csv,.zip" multiple hidden>
+
+  <!-- Step 1: drop the files -->
+  <section id="dropZone" class="dropzone">
+    <div class="drop-icon">📥</div>
+    <h2>Drop your grading worksheet (.csv) and the submissions (.zip) here</h2>
+    <p>or <button id="chooseBtn" class="linklike">choose the files</button>. You can select both at once.</p>
+    <ul class="load-status">
+      <li id="csvStatus">📄 CSV: not loaded yet</li>
+      <li id="zipStatus">🗜️ ZIP: not loaded yet <span class="muted">(optional)</span></li>
+    </ul>
+  </section>
+
+  <!-- Step 2: correct student by student -->
+  <main id="app" class="app" hidden>
+    <aside class="sidebar">
+      <div class="progress">
+        <div id="progressText"></div>
+        <div class="progress-bar"><span id="progressFill"></span></div>
+      </div>
+      <ul id="studentList" class="student-list"></ul>
+    </aside>
+
+    <section class="workspace" id="workspace">
+      <div class="student-head">
+        <div>
+          <h2 id="studentName"></h2>
+          <div id="studentMeta" class="meta"></div>
+        </div>
+        <label class="grade-box">Grade
+          <input id="gradeInput" type="text" inputmode="decimal" autocomplete="off">
+          <span id="maxGrade" class="muted"></span>
+        </label>
+      </div>
+
+      <div class="columns">
+        <div class="production-col">
+          <h3 class="section-title">Student's production</h3>
+          <div id="recordings" class="recordings"></div>
+          <div id="production" class="production" contenteditable="true" spellcheck="false"></div>
+          <div id="linkBar" class="link-bar"></div>
+          <div id="fileBar" class="link-bar"></div>
+        </div>
+
+        <div class="feedback-col">
+          <h3 class="section-title">Your feedback</h3>
+          <div id="fields"></div>
+          <div class="nav">
+            <button id="prevBtn" class="btn ghost">◀ Previous</button>
+            <span id="position" class="muted"></span>
+            <button id="nextBtn" class="btn">Next ▶</button>
+          </div>
+          <p class="hint">Alt + ↑ / ↓ moves between students. Empty fields won't appear in the student's feedback.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="zeroDialog" class="dialog">
+    <form method="dialog">
+      <h3>❌ Give 0 to students who handed nothing in</h3>
+      <p id="zeroCount" class="muted"></p>
+      <label class="check">
+        <input type="checkbox" id="zeroAddMessage" checked>
+        Also add this message as their General comment
+      </label>
+      <textarea id="zeroMessage" rows="3"></textarea>
+      <p class="muted small">Students who already have a grade keep it (and get no message). Existing General comments are never replaced.</p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn ghost">Cancel</button>
+        <button value="apply" id="zeroApply" class="btn primary">Apply</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+
+  <script>
+    const FIELDS = [
+      { key: "general",       icon: "💬", title: "General comment",   rows: 5, placeholder: "Overall impression, strengths, what to work on…" },
+      { key: "language",      icon: "✏️", title: "Language mistakes", rows: 3, placeholder: "Grammar, spelling, syntax…" },
+      { key: "vocab",         icon: "📚", title: "Vocabulary",        rows: 3, placeholder: "Useful words, better collocations…" },
+      { key: "pronunciation", icon: "🗣️", title: "Pronunciation",     rows: 3, placeholder: "Sounds, stress, intonation…" }
+    ];
+    const DEFAULT_ZERO_MESSAGE = "I would strongly advise to do these exercises!";
+
+    const headerMap = {
+      "Full name": "name",
+      "Nom complet": "name",
+      "Grade": "grade",
+      "Note": "grade",
+      "Maximum grade": "maxGrade",
+      "Note maximale": "maxGrade",
+      "Online text": "text",
+      "Texte en ligne": "text",
+      "Feedback comments": "feedback",
+      "Feedback par commentaires": "feedback",
+      "Last modified (submission)": "submissionDate",
+      "Dernière modification (travail remis)": "submissionDate",
+      "Last modified (grade)": "gradeDate",
+      "Dernière modification (note)": "gradeDate"
+    };
+
+    let csvName = "";
+    let delimiter = ",";
+    let headers = [];
+    let col = {};          // type -> original header
+    let rows = [];         // { cells, fb, fb0, submitted }
+    let order = [];        // indices into rows, handed-in first
+    let current = 0;       // position in order
+    let zipHTML = {};      // student name -> html
+    let zipFiles = {};     // student name -> [{ path, base, url }]
+    let studentEditMap = {};
+    let zipLoaded = false;
+    let dirty = false;
+    let speed = Number(storageGet("gm-speed")) || 1;
+
+    const $ = id => document.getElementById(id);
+
+    function storageGet(key) {
+      try { return localStorage.getItem(key); } catch (e) { return null; }
+    }
+    function storageSet(key, value) {
+      try { localStorage.setItem(key, value); } catch (e) { /* storage unavailable */ }
+    }
+
+    // ---------- CSV ----------
+
+    function detectDelimiter(text) {
+      const firstLine = text.split(/\r?\n/, 1)[0];
+      const counts = [",", ";", "\t"].map(d => [d, firstLine.split(d).length]);
+      return counts.sort((a, b) => b[1] - a[1])[0][0];
+    }
+
+    function parseCSVText(text, d) {
+      const out = [];
+      let row = [], field = "", quoted = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (quoted) {
+          if (c === '"') {
+            if (text[i + 1] === '"') { field += '"'; i++; }
+            else quoted = false;
+          } else field += c;
+        } else if (c === '"') quoted = true;
+        else if (c === d) { row.push(field); field = ""; }
+        else if (c === "\n" || c === "\r") {
+          if (c === "\r" && text[i + 1] === "\n") i++;
+          row.push(field); out.push(row); row = []; field = "";
+        } else field += c;
+      }
+      if (field !== "" || row.length) { row.push(field); out.push(row); }
+      return out.filter(r => r.some(v => v.trim() !== ""));
+    }
+
+    function convertToCSV(rowsToSave) {
+      const quote = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const lines = rowsToSave.map(r => headers.map(h => quote(r.cells[h])).join(delimiter));
+      return [headers.map(quote).join(delimiter), ...lines].join("\n");
+    }
+
+    function loadCSV(text, name) {
+      text = text.replace(/^﻿/, "");
+      delimiter = detectDelimiter(text);
+      const table = parseCSVText(text, delimiter);
+      if (!table.length) { toast("⚠️ This CSV looks empty."); return false; }
+
+      headers = table.shift().map(h => h.trim());
+      col = {};
+      headers.forEach(h => { if (headerMap[h] && !col[headerMap[h]]) col[headerMap[h]] = h; });
+      if (!col.name || !col.grade) {
+        toast("⚠️ This doesn't look like a Moodle grading worksheet (no name or grade column).");
+        return false;
+      }
+      if (!col.feedback) {
+        col.feedback = "Feedback comments";
+        headers.push(col.feedback);
+        toast("ℹ️ No feedback column found, a “Feedback comments” column was added.");
+      }
+
+      csvName = name;
+      studentEditMap = {};
+      rows = table.map(values => {
+        const cells = {};
+        headers.forEach((h, i) => cells[h] = values[i] ?? "");
+        const fb = parseFeedback(cells[col.feedback]);
+        return { cells, fb, fb0: { ...fb }, grade0: (cells[col.grade] || "").trim() };
+      });
+      dirty = false;
+      return true;
+    }
+
+    // ---------- Feedback HTML <-> fields ----------
+
+    const normTitle = s => s.replace(/[^a-zà-ÿ ]/gi, "").trim().toLowerCase();
+
+    function emptyFeedback() {
+      return Object.fromEntries(FIELDS.map(f => [f.key, ""]));
+    }
+
+    function htmlToText(html) {
+      const t = document.createElement("textarea");
+      t.innerHTML = html
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
+        .replace(/<[^>]*>/g, "");
+      return t.value.replace(/\n{3,}/g, "\n\n").trim();
+    }
+
+    // Moodle's export strips the HTML, leaving "💬 General commentText…   📚 VocabularyText…"
+    const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const FLAT_TITLE = new RegExp(FIELDS.map(f =>
+      escapeRegExp(f.icon.replace(/️/g, "")) + "\\uFE0F?\\s*" + escapeRegExp(f.title)).join("|"), "g");
+
+    function parseFlatFeedback(text) {
+      const marks = [...text.matchAll(FLAT_TITLE)];
+      if (!marks.length) return null;
+      const fb = emptyFeedback();
+      marks.forEach((m, i) => {
+        const field = FIELDS.find(f => m[0].endsWith(f.title));
+        const end = i + 1 < marks.length ? marks[i + 1].index : text.length;
+        fb[field.key] = text.slice(m.index + m[0].length, end).trim();
+      });
+      const before = text.slice(0, marks[0].index).trim();
+      if (before) fb.general = (before + "\n" + fb.general).trim();
+      return fb;
+    }
+
+    // Reads feedback produced by this app back into the four fields.
+    // Older feedback (single "Teacher feedback" block) goes into General comment.
+    function parseFeedback(html) {
+      const fb = emptyFeedback();
+      if (!html || !html.trim()) return fb;
+      if (!/<[a-z][^>]*>/i.test(html)) {
+        const flat = parseFlatFeedback(htmlToText(html));
+        if (flat) return flat;
+      }
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const heads = [...doc.querySelectorAll("h1,h2,h3,h4,h5,h6")];
+      const known = heads.filter(h => FIELDS.some(f => normTitle(f.title) === normTitle(h.textContent)));
+
+      if (known.length) {
+        known.forEach(h => {
+          const field = FIELDS.find(f => normTitle(f.title) === normTitle(h.textContent));
+          const parts = [];
+          for (let n = h.nextElementSibling; n && !/^H[1-6]$/.test(n.tagName); n = n.nextElementSibling) {
+            parts.push(htmlToText(n.outerHTML));
+          }
+          fb[field.key] = parts.join("\n").trim();
+        });
+      } else {
+        heads.forEach(h => h.remove());
+        fb.general = htmlToText(doc.body.innerHTML);
+      }
+      return fb;
+    }
+
+    function escapeHTML(s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function buildFeedbackHTML(fb) {
+      const sections = FIELDS.filter(f => fb[f.key].trim()).map(f =>
+        `<div style="margin:0 0 14px;">` +
+          `<h3 style="color:#007bff;margin:0 0 6px;font-family:Arial, sans-serif;font-size:1.05em;">${f.icon} ${f.title}</h3>` +
+          `<p style="margin:0;line-height:1.5;">${escapeHTML(fb[f.key].trim()).replace(/\n/g, "<br>")}</p>` +
+        `</div>`);
+      if (!sections.length) return "";
+      return `<div style="margin:15px 0;padding:14px 16px 2px;border-left:5px solid #007bff;background:#f9f9ff;box-shadow:0 2px 4px rgba(0,0,0,0.1);">${sections.join("")}</div>`;
+    }
+
+    // ---------- ZIP ----------
+
+    async function loadZip(file) {
+      const zip = await new JSZip().loadAsync(file);
+      Object.values(zipFiles).flat().forEach(f => URL.revokeObjectURL(f.url));
+      zipHTML = {};
+      zipFiles = {};
+      for (const path of Object.keys(zip.files)) {
+        const entry = zip.files[path];
+        if (entry.dir) continue;
+        const student = path.split("_")[0].trim();
+        if (path.toLowerCase().endsWith(".html")) {
+          zipHTML[student] = await entry.async("string");
+        } else {
+          const blob = await entry.async("blob");
+          (zipFiles[student] ||= []).push({ path, base: path.split("/").pop(), url: URL.createObjectURL(blob) });
+        }
+      }
+      zipLoaded = true;
+      studentEditMap = {};
+    }
+
+    // ---------- Students ----------
+
+    const studentName = r => r.cells[col.name] || "";
+    const gradeOf = r => (r.cells[col.grade] || "").trim();
+    const isGradeEmpty = r => gradeOf(r) === "" || gradeOf(r) === "-";
+    const hasFeedback = r => FIELDS.some(f => r.fb[f.key].trim() !== "");
+
+    function hasSubmission(r) {
+      const name = studentName(r);
+      if (zipHTML[name] || (zipFiles[name] || []).length) return true;
+      return htmlToText(r.cells[col.text] || "") !== "";
+    }
+
+    function isResubmitted(r) {
+      const sub = new Date(r.cells[col.submissionDate] || "");
+      const graded = new Date(r.cells[col.gradeDate] || "");
+      return !isNaN(sub) && !isNaN(graded) && sub > graded;
+    }
+
+    function buildOrder() {
+      rows.forEach(r => r.submitted = hasSubmission(r));
+      order = rows.map((r, i) => i).sort((a, b) => rows[b].submitted - rows[a].submitted);
+      current = Math.min(current, Math.max(order.length - 1, 0));
+    }
+
+    function statusOf(r) {
+      if (!r.submitted) return isGradeEmpty(r) ? "missing" : "missing-done";
+      return (!isGradeEmpty(r) || hasFeedback(r)) ? "done" : "todo";
+    }
+
+    function renderList() {
+      const list = $("studentList");
+      list.innerHTML = "";
+      order.forEach((idx, pos) => {
+        const r = rows[idx];
+        const li = document.createElement("li");
+        li.className = "student-item " + statusOf(r) + (pos === current ? " active" : "");
+        li.innerHTML = `<span class="dot"></span><span class="name"></span><span class="badge"></span>`;
+        li.querySelector(".name").textContent = studentName(r) || "(no name)";
+        li.querySelector(".badge").textContent = (isResubmitted(r) ? "🔄 " : "") + (isGradeEmpty(r) ? "" : gradeOf(r));
+        li.title = r.submitted ? "" : "Nothing handed in";
+        li.addEventListener("click", () => select(pos));
+        list.appendChild(li);
+      });
+      updateProgress();
+    }
+
+    function refreshListItem(pos) {
+      const li = $("studentList").children[pos];
+      if (!li) return;
+      const r = rows[order[pos]];
+      li.className = "student-item " + statusOf(r) + (pos === current ? " active" : "");
+      li.querySelector(".badge").textContent = (isResubmitted(r) ? "🔄 " : "") + (isGradeEmpty(r) ? "" : gradeOf(r));
+      updateProgress();
+    }
+
+    function updateProgress() {
+      const handedIn = rows.filter(r => r.submitted);
+      const done = handedIn.filter(r => statusOf(r) === "done").length;
+      $("progressText").innerHTML =
+        `<strong>${done} / ${handedIn.length}</strong> productions corrected<br>` +
+        `<span class="muted">${rows.length - handedIn.length} not handed in</span>`;
+      $("progressFill").style.width = handedIn.length ? (100 * done / handedIn.length) + "%" : "0";
+    }
+
+    // ---------- Current student ----------
+
+    function buildFields() {
+      const box = $("fields");
+      FIELDS.forEach(f => {
+        const label = document.createElement("label");
+        label.className = "field";
+        label.innerHTML = `<span class="field-title">${f.icon} ${f.title}</span>`;
+        const ta = document.createElement("textarea");
+        ta.id = "field-" + f.key;
+        ta.rows = f.rows;
+        ta.placeholder = f.placeholder;
+        ta.addEventListener("input", () => {
+          const r = rows[order[current]];
+          r.fb[f.key] = ta.value;
+          dirty = true;
+          autoGrow(ta);
+          refreshListItem(current);
+        });
+        label.appendChild(ta);
+        box.appendChild(label);
+      });
+    }
+
+    function autoGrow(ta) {
+      ta.style.height = "auto";
+      ta.style.height = ta.scrollHeight + 2 + "px";
+    }
+
+    function select(pos) {
+      if (pos < 0 || pos >= order.length) return;
+      const previous = current;
+      current = pos;
+      refreshListItem(previous);
+      refreshListItem(current);
+      renderStudent();
+      $("studentList").children[current]?.scrollIntoView({ block: "nearest" });
+    }
+
+    function renderStudent() {
+      const r = rows[order[current]];
+      if (!r) return;
+      const name = studentName(r);
+
+      $("studentName").textContent = name || "(no name)";
+      const meta = [];
+      if (!r.submitted) meta.push("❌ Nothing handed in");
+      else if (r.cells[col.submissionDate]) meta.push("Handed in: " + r.cells[col.submissionDate]);
+      if (isResubmitted(r)) meta.push("🔄 Modified since last grade");
+      $("studentMeta").textContent = meta.join(" · ");
+
+      $("gradeInput").value = gradeOf(r);
+      const max = col.maxGrade ? (r.cells[col.maxGrade] || "").trim() : "";
+      $("maxGrade").textContent = max ? "/ " + max.replace(/\.0+$/, "") : "";
+
+      FIELDS.forEach(f => {
+        const ta = $("field-" + f.key);
+        ta.value = r.fb[f.key];
+        autoGrow(ta);
+      });
+
+      renderProduction(r);
+
+      $("position").textContent = `${current + 1} / ${order.length}`;
+      $("prevBtn").disabled = current === 0;
+      $("nextBtn").disabled = current === order.length - 1;
+      $("workspace").scrollTop = 0;
+    }
+
+    function sanitize(html) {
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      doc.querySelectorAll("script, style, iframe, object, embed, link, meta, form").forEach(e => e.remove());
+      doc.querySelectorAll("*").forEach(el => {
+        [...el.attributes].forEach(a => {
+          if (/^on/i.test(a.name) || /^\s*javascript:/i.test(a.value)) el.removeAttribute(a.name);
+        });
+      });
+      return doc;
+    }
+
+    function renderProduction(r) {
+      const box = $("production");
+      const name = studentName(r);
+      const files = zipFiles[name] || [];
+      const usedFiles = new Set();
+      box.classList.remove("plain", "empty");
+
+      if (studentEditMap[name] !== undefined) {
+        box.innerHTML = studentEditMap[name];
+      } else if (zipHTML[name]) {
+        const doc = sanitize(zipHTML[name]);
+        doc.querySelectorAll("img").forEach(img => {
+          const src = decodeURIComponent((img.getAttribute("src") || "").split(/[?#]/)[0].split("/").pop());
+          const file = src && files.find(f => f.base === src || f.base.endsWith("_" + src));
+          if (file) { img.src = file.url; usedFiles.add(file); }
+        });
+        box.innerHTML = doc.body.innerHTML;
+      } else if (htmlToText(r.cells[col.text] || "")) {
+        let raw = (r.cells[col.text] || "").replace(/<br\s*\/?>/gi, "\n");
+        raw = raw.replace(/([.?!])\s+([A-ZÀ-ÖØ-Ý])/g, "$1<br><br>$2");
+        box.innerHTML = sanitize(raw).body.innerHTML;
+        box.classList.add("plain");
+      } else {
+        box.innerHTML = files.length ? "" : "Nothing handed in.";
+        box.classList.add("empty");
+      }
+
+      if (box.classList.contains("empty") && files.length) box.textContent = "No text, only attached files (below).";
+
+      const fileBar = $("fileBar");
+      fileBar.innerHTML = "";
+      files.filter(f => !usedFiles.has(f)).forEach(f => {
+        const a = document.createElement("a");
+        a.className = "link-btn file";
+        a.href = f.url;
+        a.download = f.base;
+        a.textContent = "📎 " + f.base.replace(/^.*?_assignsubmission_file_?/, "");
+        a.title = f.path;
+        fileBar.appendChild(a);
+      });
+
+      renderLinksAndRecordings();
+    }
+
+    // ---------- Links and recordings ----------
+
+    // Find http(s) and www. URLs in the student text and in <a href> links
+    function extractURLs(box) {
+      const found = [];
+      box.querySelectorAll("a[href]").forEach(a => found.push(a.getAttribute("href")));
+      // Turn tags (e.g. <br>) into spaces so URLs don't merge with neighbouring words, then decode entities like &amp;
+      const decoder = document.createElement("textarea");
+      decoder.innerHTML = box.innerHTML.replace(/<[^>]*>/g, " ");
+      const matches = decoder.value.match(/\b(?:https?:\/\/|www\.)[^\s<>"']+/gi) || [];
+      found.push(...matches);
+
+      const urls = new Set();
+      found.forEach(raw => {
+        let u = raw.trim().replace(/[.,;:!?)\]}]+$/, "");
+        if (/^www\./i.test(u)) u = "https://" + u;
+        try {
+          const parsed = new URL(u);
+          if (parsed.protocol === "http:" || parsed.protocol === "https:") urls.add(parsed.href);
+        } catch (e) { /* not a valid URL */ }
+      });
+      return [...urls];
+    }
+
+    const AUDIO_EXT = /\.(mp3|wav|ogg|oga|m4a|aac|webm|opus|flac)$/i;
+
+    // Returns the direct audio sources behind a link (tried in order), or null if it isn't a recording
+    function audioPlan(url) {
+      const u = new URL(url);
+      const host = u.hostname.replace(/^www\./, "").toLowerCase();
+      if (host === "vocaroo.com" || host === "voca.ro") {
+        const m = u.pathname.match(/^\/(?:embed\/)?(\w{8,})\/?$/);
+        // media.vocaroo.com serves the mp3 to any page; media1 needs a vocaroo.com referrer but is kept as fallback
+        return m ? [`https://media.vocaroo.com/mp3/${m[1]}`, `https://media1.vocaroo.com/mp3/${m[1]}`] : null;
+      }
+      if (/(^|\.)vocaroo\.com$/.test(host) && u.pathname.startsWith("/mp3/")) return [url];
+      // Linguabot: recording.php?t=… is a page; the same URL with raw=1 is the audio file itself
+      if (u.pathname.endsWith("/recording.php") && u.searchParams.has("t")) {
+        const raw = new URL(u);
+        raw.searchParams.set("raw", "1");
+        return [raw.href];
+      }
+      if (AUDIO_EXT.test(u.pathname)) return [url];
+      return null;
+    }
+
+    function tryAudioSource(audio, src) {
+      return new Promise(resolve => {
+        const done = ok => {
+          clearTimeout(timer);
+          audio.removeEventListener("loadedmetadata", onOk);
+          audio.removeEventListener("error", onErr);
+          resolve(ok);
+        };
+        const onOk = () => done(true);
+        const onErr = () => done(false);
+        const timer = setTimeout(() => done(false), 15000);
+        audio.addEventListener("loadedmetadata", onOk);
+        audio.addEventListener("error", onErr);
+        audio.src = src;
+        audio.load();
+      });
+    }
+
+    function setSpeed(value) {
+      speed = value;
+      storageSet("gm-speed", String(value));
+      document.querySelectorAll("#recordings audio").forEach(a => { a.defaultPlaybackRate = value; a.playbackRate = value; });
+      document.querySelectorAll("#recordings .speed button").forEach(b => b.classList.toggle("on", Number(b.dataset.speed) === value));
+    }
+
+    function makePlayer(url, plan) {
+      const wrap = document.createElement("div");
+      wrap.className = "player";
+      const host = new URL(url).hostname.replace(/^www\./, "");
+      const label = host.includes("vocaroo") || host === "voca.ro" ? "Vocaroo"
+                  : url.includes("/recording.php") ? "Linguabot" : host;
+      wrap.innerHTML = `<div class="player-head"><span>🎧 ${escapeHTML(label)}</span><span class="speed"></span></div><div class="player-status muted">Loading recording…</div>`;
+
+      const speedBox = wrap.querySelector(".speed");
+      [1, 1.5, 2].forEach(v => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.dataset.speed = v;
+        b.textContent = "×" + v;
+        b.classList.toggle("on", v === speed);
+        b.addEventListener("click", () => setSpeed(v));
+        speedBox.appendChild(b);
+      });
+
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.preload = "metadata";
+      audio.hidden = true;
+      wrap.appendChild(audio);
+      const status = wrap.querySelector(".player-status");
+
+      (async () => {
+        for (const src of plan) {
+          if (await tryAudioSource(audio, src)) return ready();
+        }
+        audio.remove();
+        status.innerHTML = "";
+        status.append("Couldn't play this recording here. ");
+        const a = document.createElement("a");
+        a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+        a.textContent = "Open it in a new tab ↗";
+        status.appendChild(a);
+      })();
+
+      function ready() {
+        status.remove();
+        audio.hidden = false;
+        audio.defaultPlaybackRate = speed;
+        audio.playbackRate = speed;
+      }
+      return wrap;
+    }
+
+    let lastRecordingKey = "";
+
+    function renderLinksAndRecordings() {
+      const urls = extractURLs($("production"));
+      const bar = $("linkBar");
+      bar.innerHTML = "";
+      const audioLinks = [];
+      urls.forEach(url => {
+        const plan = audioPlan(url);
+        if (plan) audioLinks.push([url, plan]);
+        const a = document.createElement("a");
+        a.className = "link-btn";
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.title = url;
+        const parsed = new URL(url);
+        a.textContent = (plan ? "🎧 " : "🔗 ") + parsed.hostname.replace(/^www\./, "") + (parsed.pathname.length > 1 ? parsed.pathname : "");
+        bar.appendChild(a);
+      });
+
+      // Only rebuild players when the set of recordings changes (not on every keystroke)
+      const key = order[current] + "|" + audioLinks.map(([u]) => u).join("|");
+      if (key === lastRecordingKey) return;
+      lastRecordingKey = key;
+      const rec = $("recordings");
+      rec.querySelectorAll("audio").forEach(a => a.pause());
+      rec.innerHTML = "";
+      audioLinks.forEach(([url, plan]) => rec.appendChild(makePlayer(url, plan)));
+    }
+
+    // ---------- Bulk grading ----------
+
+    function giveOneToHandedIn() {
+      let given = 0, kept = 0;
+      rows.filter(r => r.submitted).forEach(r => {
+        if (isGradeEmpty(r)) { r.cells[col.grade] = "1"; given++; } else kept++;
+      });
+      if (given) dirty = true;
+      renderList();
+      renderStudent();
+      toast(`✅ 1 given to ${given} student${given === 1 ? "" : "s"}` + (kept ? ` · ${kept} already had a grade and kept it` : ""));
+    }
+
+    function openZeroDialog() {
+      const missing = rows.filter(r => !r.submitted);
+      $("zeroCount").textContent = missing.length
+        ? `${missing.length} student${missing.length === 1 ? "" : "s"} handed nothing in.`
+        : "Every student handed something in.";
+      $("zeroMessage").value = storageGet("gm-zero-message") ?? DEFAULT_ZERO_MESSAGE;
+      $("zeroMessage").disabled = !$("zeroAddMessage").checked;
+      $("zeroDialog").returnValue = "";
+      $("zeroDialog").showModal();
+    }
+
+    function applyZero() {
+      const message = $("zeroMessage").value.trim();
+      const addMessage = $("zeroAddMessage").checked && message !== "";
+      storageSet("gm-zero-message", $("zeroMessage").value);
+      let given = 0, commented = 0;
+      rows.filter(r => !r.submitted).forEach(r => {
+        if (isGradeEmpty(r)) { r.cells[col.grade] = "0"; given++; }
+        // Only students on 0 get the message (someone with a real grade may have handed in on paper)
+        if (addMessage && Number(gradeOf(r).replace(",", ".")) === 0 && !r.fb.general.trim()) { r.fb.general = message; commented++; }
+      });
+      if (given || commented) dirty = true;
+      renderList();
+      renderStudent();
+      toast(`❌ 0 given to ${given} student${given === 1 ? "" : "s"}` + (addMessage ? ` · message added to ${commented}` : ""));
+    }
+
+    // ---------- Save ----------
+
+    // Only students whose grade or feedback changed since the CSV was loaded are exported,
+    // so Moodle leaves everyone else untouched (its own export has stripped their feedback HTML).
+    function saveCSV() {
+      const changedRows = rows.filter(r => {
+        const feedbackChanged = FIELDS.some(f => r.fb[f.key].trim() !== r.fb0[f.key].trim());
+        if (feedbackChanged) r.cells[col.feedback] = buildFeedbackHTML(r.fb);
+        return feedbackChanged || gradeOf(r) !== r.grade0;
+      });
+      if (!changedRows.length) {
+        toast("Nothing has changed since the CSV was loaded, so there's nothing to download.");
+        return;
+      }
+      const blob = new Blob([convertToCSV(changedRows)], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = (csvName.replace(/\.csv$/i, "") || "students") + "_graded.csv";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      dirty = false;
+      const n = changedRows.length;
+      toast(`💾 CSV downloaded with the ${n} student${n === 1 ? "" : "s"} you changed. Upload it to Moodle.`);
+    }
+
+    // ---------- Loading files ----------
+
+    async function handleFiles(fileList) {
+      const files = [...fileList];
+      const csv = files.find(f => /\.csv$/i.test(f.name));
+      const zip = files.find(f => /\.zip$/i.test(f.name));
+      if (!csv && !zip) { toast("⚠️ Please drop a .csv and/or a .zip file."); return; }
+      if (csv && dirty && !confirm("Load a new CSV? Changes you haven't downloaded will be lost.")) return;
+
+      if (zip) {
+        $("zipStatus").textContent = "🗜️ ZIP: reading " + zip.name + "…";
+        try {
+          await loadZip(zip);
+          $("zipStatus").textContent = "🗜️ ZIP: " + zip.name + " ✓";
+        } catch (e) {
+          $("zipStatus").textContent = "🗜️ ZIP: couldn't read " + zip.name;
+          toast("⚠️ Couldn't read the ZIP file.");
+        }
+      }
+      if (csv) {
+        if (loadCSV(await csv.text(), csv.name)) {
+          current = 0;
+          $("csvStatus").textContent = "📄 CSV: " + csv.name + " ✓";
+        }
+      }
+
+      if (rows.length) {
+        $("dropZone").hidden = true;
+        $("app").hidden = false;
+        $("actions").hidden = false;
+        lastRecordingKey = "";
+        buildOrder();
+        renderList();
+        renderStudent();
+        if (zip && csv) toast(`📥 ${rows.length} students loaded.`);
+        else if (zip) toast("🗜️ Submissions loaded.");
+      } else if (zip && !csv) {
+        toast("🗜️ ZIP loaded. Now add the CSV.");
+      }
+    }
+
+    // ---------- Wiring ----------
+
+    buildFields();
+
+    $("chooseBtn").addEventListener("click", () => $("fileInput").click());
+    $("addFilesBtn").addEventListener("click", () => $("fileInput").click());
+    $("fileInput").addEventListener("change", e => { handleFiles(e.target.files); e.target.value = ""; });
+
+    window.addEventListener("dragover", e => { e.preventDefault(); document.body.classList.add("dragging"); });
+    window.addEventListener("dragleave", e => { if (!e.relatedTarget) document.body.classList.remove("dragging"); });
+    window.addEventListener("drop", e => {
+      e.preventDefault();
+      document.body.classList.remove("dragging");
+      if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+    });
+
+    $("gradeInput").addEventListener("input", e => {
+      rows[order[current]].cells[col.grade] = e.target.value;
+      dirty = true;
+      refreshListItem(current);
+    });
+
+    $("production").addEventListener("input", () => {
+      studentEditMap[studentName(rows[order[current]])] = $("production").innerHTML;
+      renderLinksAndRecordings();
+    });
+
+    $("prevBtn").addEventListener("click", () => select(current - 1));
+    $("nextBtn").addEventListener("click", () => select(current + 1));
+    document.addEventListener("keydown", e => {
+      if (!e.altKey || $("app").hidden || $("zeroDialog").open) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); select(current + 1); }
+      if (e.key === "ArrowUp") { e.preventDefault(); select(current - 1); }
+    });
+
+    $("oneAllBtn").addEventListener("click", giveOneToHandedIn);
+    $("zeroMissingBtn").addEventListener("click", openZeroDialog);
+    $("zeroAddMessage").addEventListener("change", e => $("zeroMessage").disabled = !e.target.checked);
+    $("zeroDialog").addEventListener("close", () => { if ($("zeroDialog").returnValue === "apply") applyZero(); });
+    $("saveBtn").addEventListener("click", saveCSV);
+
+    let toastTimer;
+    function toast(message) {
+      const t = $("toast");
+      t.textContent = message;
+      t.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => t.classList.remove("show"), 4500);
+    }
+
+    window.addEventListener("beforeunload", e => {
+      if (dirty) {
+        e.preventDefault();
+        e.returnValue = "You have unsaved changes. Are you sure you want to leave?";
+      }
+    });
+  </script>
+</body>
+</html>

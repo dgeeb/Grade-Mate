@@ -467,6 +467,12 @@ body.dragging .app {
     margin-top: 6px;
 }
 
+.copy-row {
+    display: flex;
+    justify-content: flex-end;
+    margin: 4px 0 10px;
+}
+
 .nav .btn:not(.ghost) {
     background: linear-gradient(to bottom, var(--blue), var(--blue-dark));
     color: #fff;

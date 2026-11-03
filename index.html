@@ -71,6 +71,9 @@
         <div class="feedback-col">
           <h3 class="section-title">Your feedback</h3>
           <div id="fields"></div>
+          <div class="copy-row">
+            <button id="copyFeedbackBtn" class="btn ghost" title="Copies this student's feedback, ready to paste into Moodle">📋 Copy feedback HTML</button>
+          </div>
           <div class="nav">
             <button id="prevBtn" class="btn ghost">◀ Previous</button>
             <span id="position" class="muted"></span>
@@ -293,6 +296,27 @@
         `</div>`);
       if (!sections.length) return "";
       return `<div style="margin:15px 0;padding:14px 16px 2px;border-left:5px solid #007bff;background:#f9f9ff;box-shadow:0 2px 4px rgba(0,0,0,0.1);">${sections.join("")}</div>`;
+    }
+
+    // Copies both the formatted feedback (for Moodle's editor) and its source code
+    // (for the HTML view or any plain text field), so it pastes well anywhere.
+    async function copyFeedback() {
+      const html = buildFeedbackHTML(rows[order[current]].fb);
+      if (!html) return toast("ℹ️ This student has no feedback to copy yet.");
+      try {
+        await navigator.clipboard.write([new ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([html], { type: "text/plain" })
+        })]);
+      } catch (e) {
+        const ta = document.createElement("textarea");
+        ta.value = html;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      toast("📋 Feedback copied. Paste it wherever you need it.");
     }
 
     // ---------- ZIP ----------
@@ -792,6 +816,7 @@
       renderLinksAndRecordings();
     });
 
+    $("copyFeedbackBtn").addEventListener("click", copyFeedback);
     $("prevBtn").addEventListener("click", () => select(current - 1));
     $("nextBtn").addEventListener("click", () => select(current + 1));
     document.addEventListener("keydown", e => {

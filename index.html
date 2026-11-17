@@ -43,7 +43,10 @@
       <div class="progress">
         <div id="progressText"></div>
         <div class="progress-bar"><span id="progressFill"></span></div>
+        <div id="saveState" class="save-state" hidden><span id="saveText"></span> · <button id="resetBtn" class="linklike" type="button">start over</button></div>
       </div>
+      <input id="filterInput" class="filter" type="search" placeholder="🔍 Find a student…" autocomplete="off"
+             title="Enter opens the first match · Shift + Enter adds them to the student you are correcting">
       <ul id="studentList" class="student-list"></ul>
     </aside>
 
@@ -53,15 +56,18 @@
           <h2 id="studentName"></h2>
           <div id="studentMeta" class="meta"></div>
         </div>
-        <label class="grade-box">Grade
-          <input id="gradeInput" type="text" inputmode="decimal" autocomplete="off">
-          <span id="maxGrade" class="muted"></span>
-        </label>
+        <div class="head-tools">
+          <button id="groupBtn" class="btn ghost" type="button" title="Several students worked on this production? Correct them side by side.">👥 Correct together</button>
+          <label class="grade-box" id="gradeBox">Grade
+            <input id="gradeInput" type="text" inputmode="decimal" autocomplete="off">
+            <span id="maxGrade" class="muted"></span>
+          </label>
+        </div>
       </div>
 
-      <div class="columns">
+      <div class="columns" id="columns">
         <div class="production-col">
-          <h3 class="section-title">Student's production</h3>
+          <h3 class="section-title" id="productionTitle">Student's production</h3>
           <div id="recordings" class="recordings"></div>
           <div id="production" class="production" contenteditable="true" spellcheck="false"></div>
           <div id="linkBar" class="link-bar"></div>
@@ -70,8 +76,9 @@
 
         <div class="feedback-col">
           <h3 class="section-title">Your feedback</h3>
+          <p id="groupHint" class="group-hint" hidden>Alt + 1, 2, 3… jumps to that student's notes. “→ all” copies a grade or a comment to the whole group. They stay together until you take someone out with ✕.</p>
           <div id="fields"></div>
-          <div class="copy-row">
+          <div class="copy-row" id="copyRow">
             <button id="copyFeedbackBtn" class="btn ghost" title="Copies this student's feedback, ready to paste into Moodle">📋 Copy feedback HTML</button>
           </div>
           <div class="nav">
@@ -79,7 +86,7 @@
             <span id="position" class="muted"></span>
             <button id="nextBtn" class="btn">Next ▶</button>
           </div>
-          <p class="hint">Alt + ↑ / ↓ moves between students. Empty fields won't appear in the student's feedback.</p>
+          <p class="hint">Alt + ↑ / ↓ moves between students. Empty fields won't appear in the student's feedback. Your work is saved in this browser as you type.</p>
         </div>
       </div>
     </section>
@@ -137,6 +144,10 @@
     let rows = [];         // { cells, fb, fb0, submitted }
     let order = [];        // indices into rows, handed-in first
     let current = 0;       // position in order
+    let groups = [];       // arrays of row indices that are corrected together (same production)
+    let shownRow = 0;      // row whose production is on screen
+    let draftKey = "";     // identifies the loaded CSV in the saved drafts
+    let restoreNote = "";
     let zipHTML = {};      // student name -> html
     let zipFiles = {};     // student name -> [{ path, base, url }]
     let studentEditMap = {};
@@ -150,7 +161,7 @@
       try { return localStorage.getItem(key); } catch (e) { return null; }
     }
     function storageSet(key, value) {
-      try { localStorage.setItem(key, value); } catch (e) { /* storage unavailable */ }
+      try { localStorage.setItem(key, value); return true; } catch (e) { return false; }
     }
 
     // ---------- CSV ----------
@@ -216,7 +227,83 @@
         return { cells, fb, fb0: { ...fb }, grade0: (cells[col.grade] || "").trim() };
       });
       dirty = false;
+      groups = [];
+      draftKey = hashText(text);
+      restoreDraft();
       return true;
+    }
+
+    // ---------- Draft (kept in this browser) ----------
+
+    // Everything typed is saved as you go, tied to this exact CSV, so the page can be
+    // closed and the same worksheet dropped back in later.
+    function hashText(text) {
+      let h = 5381;
+      for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+      return (h >>> 0).toString(36) + "-" + text.length;
+    }
+
+    function readDrafts() {
+      try { return JSON.parse(storageGet("gm-drafts")) || {}; } catch (e) { return {}; }
+    }
+
+    const isChanged = r => gradeOf(r) !== r.grade0 || FIELDS.some(f => r.fb[f.key].trim() !== r.fb0[f.key].trim());
+
+    let draftTimer;
+    function scheduleDraft() {
+      clearTimeout(draftTimer);
+      draftTimer = setTimeout(saveDraft, 400);
+    }
+
+    function saveDraft() {
+      clearTimeout(draftTimer);
+      if (!draftKey || !rows.length) return;
+      const drafts = readDrafts();
+      const changes = {};
+      rows.forEach((r, i) => { if (isChanged(r)) changes[i] = { g: r.cells[col.grade], fb: r.fb }; });
+      const hasWork = Object.keys(changes).length > 0 || groups.length > 0;
+      if (hasWork) drafts[draftKey] = { t: Date.now(), changes, groups };
+      else delete drafts[draftKey];
+      const recent = Object.entries(drafts).sort((a, b) => b[1].t - a[1].t).slice(0, 8);
+      const stored = storageSet("gm-drafts", JSON.stringify(Object.fromEntries(recent)));
+      $("saveState").hidden = !hasWork;
+      $("saveText").textContent = stored
+        ? "✓ Saved in this browser at " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : "⚠️ Couldn't save in this browser";
+    }
+
+    function restoreDraft() {
+      restoreNote = "";
+      $("saveState").hidden = true;
+      const draft = readDrafts()[draftKey];
+      if (!draft) return;
+      let n = 0;
+      Object.entries(draft.changes || {}).forEach(([i, c]) => {
+        const r = rows[i];
+        if (!r) return;
+        r.cells[col.grade] = c.g ?? "";
+        r.fb = { ...emptyFeedback(), ...c.fb };
+        n++;
+      });
+      groups = (draft.groups || []).map(g => g.filter(i => rows[i])).filter(g => g.length > 1);
+      if (!n && !groups.length) return;
+      dirty = n > 0;
+      const when = new Date(draft.t).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+      restoreNote = `↩️ Picked up where you left off (${n} student${n === 1 ? "" : "s"} already corrected, saved ${when}).`;
+      $("saveState").hidden = false;
+      $("saveText").textContent = "✓ Saved in this browser, " + when;
+    }
+
+    function startOver() {
+      if (!confirm("Throw away every grade and comment typed since this CSV was loaded?")) return;
+      rows.forEach(r => { r.cells[col.grade] = r.grade0; r.fb = { ...r.fb0 }; });
+      groups = [];
+      dirty = false;
+      saveDraft();
+      markSubmitted();
+      paintList();
+      renderStudent();
+      toast("Back to the CSV as it was loaded.");
     }
 
     // ---------- Feedback HTML <-> fields ----------
@@ -300,8 +387,8 @@
 
     // Copies both the formatted feedback (for Moodle's editor) and its source code
     // (for the HTML view or any plain text field), so it pastes well anywhere.
-    async function copyFeedback() {
-      const html = buildFeedbackHTML(rows[order[current]].fb);
+    async function copyFeedback(idx) {
+      const html = buildFeedbackHTML(rows[idx].fb);
       if (!html) return toast("ℹ️ This student has no feedback to copy yet.");
       try {
         await navigator.clipboard.write([new ClipboardItem({
@@ -360,8 +447,14 @@
       return !isNaN(sub) && !isNaN(graded) && sub > graded;
     }
 
-    function buildOrder() {
+    // A student corrected together with someone who handed in counts as handed in
+    function markSubmitted() {
       rows.forEach(r => r.submitted = hasSubmission(r));
+      groups.forEach(g => { if (g.some(i => rows[i].submitted)) g.forEach(i => rows[i].submitted = true); });
+    }
+
+    function buildOrder() {
+      markSubmitted();
       order = rows.map((r, i) => i).sort((a, b) => rows[b].submitted - rows[a].submitted);
       current = Math.min(current, Math.max(order.length - 1, 0));
     }
@@ -371,30 +464,147 @@
       return (!isGradeEmpty(r) || hasFeedback(r)) ? "done" : "todo";
     }
 
+    // ---------- Correcting several students together ----------
+
+    const groupOf = idx => groups.find(g => g.includes(idx));
+    const viewRows = () => groupOf(order[current]) || [order[current]];
+    const posOf = idx => order.indexOf(idx);
+    // The production shown for a group is the one of whoever handed something in
+    const productionRow = members => members.find(i => hasSubmission(rows[i])) ?? members[0];
+
+    function detach(idx) {
+      const g = groupOf(idx);
+      if (!g) return;
+      g.splice(g.indexOf(idx), 1);
+      if (g.length < 2) groups.splice(groups.indexOf(g), 1);
+    }
+
+    // Adds a student to (or takes them out of) the group being corrected
+    function toggleMate(idx) {
+      const cur = order[current];
+      if (idx === cur) return;
+      if (viewRows().includes(idx)) detach(idx);
+      else {
+        detach(idx);
+        const g = groupOf(cur);
+        if (g) g.push(idx); else groups.push([cur, idx]);
+      }
+      groupChanged();
+    }
+
+    function leaveGroup(idx) {
+      const g = groupOf(idx);
+      if (!g) return;
+      detach(idx);
+      if (idx === order[current]) current = posOf(g[0]);
+      groupChanged();
+    }
+
+    function groupChanged() {
+      markSubmitted();
+      paintList();
+      renderStudent();
+      scheduleDraft();
+    }
+
+    function setGrade(idx, value) {
+      rows[idx].cells[col.grade] = value;
+      dirty = true;
+      refreshListItem(posOf(idx));
+      scheduleDraft();
+    }
+
+    function gradeToAll(idx) {
+      const value = rows[idx].cells[col.grade] || "";
+      const view = viewRows();
+      view.forEach(i => rows[i].cells[col.grade] = value);
+      dirty = true;
+      paintList();
+      renderCards(view);
+      scheduleDraft();
+      toast(value.trim() ? `Grade ${value.trim()} given to the ${view.length} students.` : "Grade cleared for the whole group.");
+    }
+
+    // Copies one comment to the rest of the group, after whatever they already have
+    function commentToAll(idx, key) {
+      const text = rows[idx].fb[key].trim();
+      if (!text) return toast("ℹ️ Nothing to copy yet.");
+      const view = viewRows();
+      let n = 0;
+      view.forEach(i => {
+        const fb = rows[i].fb;
+        if (i === idx || fb[key].includes(text)) return;
+        fb[key] = fb[key].trim() ? fb[key].trim() + "\n" + text : text;
+        n++;
+      });
+      if (n) { dirty = true; scheduleDraft(); }
+      paintList();
+      renderCards(view);
+      toast(n ? `Copied to ${n} student${n === 1 ? "" : "s"}.` : "The others already have this comment.");
+    }
+
+    function focusCard(idx, key) {
+      const ta = $(`field-${idx}-${key || "general"}`);
+      if (ta) { ta.focus(); ta.scrollIntoView({ block: "nearest" }); }
+    }
+
+    // ---------- Student list ----------
+
+    const plain = s => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
     function renderList() {
       const list = $("studentList");
+      const scroll = list.scrollTop;
       list.innerHTML = "";
       order.forEach((idx, pos) => {
-        const r = rows[idx];
         const li = document.createElement("li");
-        li.className = "student-item " + statusOf(r) + (pos === current ? " active" : "");
-        li.innerHTML = `<span class="dot"></span><span class="name"></span><span class="badge"></span>`;
-        li.querySelector(".name").textContent = studentName(r) || "(no name)";
-        li.querySelector(".badge").textContent = (isResubmitted(r) ? "🔄 " : "") + (isGradeEmpty(r) ? "" : gradeOf(r));
-        li.title = r.submitted ? "" : "Nothing handed in";
-        li.addEventListener("click", () => select(pos));
+        li.innerHTML = `<span class="dot"></span><span class="name"></span><span class="badge"></span><button type="button" class="mate-btn"></button>`;
+        li.querySelector(".name").textContent = studentName(rows[idx]) || "(no name)";
+        li.addEventListener("click", e => (e.ctrlKey || e.metaKey) ? toggleMate(idx) : select(pos));
+        li.querySelector(".mate-btn").addEventListener("click", e => {
+          e.stopPropagation();
+          toggleMate(idx);
+          if ($("filterInput").value) { $("filterInput").value = ""; applyFilter(); $("filterInput").focus(); }
+        });
         list.appendChild(li);
       });
+      paintList();
+      applyFilter();
+      list.scrollTop = scroll;
+    }
+
+    function paintItem(pos, view) {
+      const li = $("studentList").children[pos];
+      if (!li) return;
+      const idx = order[pos], r = rows[idx];
+      const inView = view.includes(idx);
+      const g = groupOf(idx);
+      li.className = "student-item " + statusOf(r) + (pos === current ? " active" : inView ? " mate" : "");
+      li.querySelector(".badge").textContent = (g ? "👥 " : "") + (isResubmitted(r) ? "🔄 " : "") + (isGradeEmpty(r) ? "" : gradeOf(r));
+      li.title = g ? "Corrected together: " + g.map(i => studentName(rows[i])).join(", ")
+               : r.submitted ? "" : "Nothing handed in";
+      const btn = li.querySelector(".mate-btn");
+      btn.hidden = pos === current;
+      btn.textContent = inView ? "−" : "+";
+      btn.title = inView ? "Take out of this group" : "Correct together with " + studentName(rows[order[current]]);
+    }
+
+    function paintList() {
+      const view = viewRows();
+      order.forEach((idx, pos) => paintItem(pos, view));
       updateProgress();
     }
 
     function refreshListItem(pos) {
-      const li = $("studentList").children[pos];
-      if (!li) return;
-      const r = rows[order[pos]];
-      li.className = "student-item " + statusOf(r) + (pos === current ? " active" : "");
-      li.querySelector(".badge").textContent = (isResubmitted(r) ? "🔄 " : "") + (isGradeEmpty(r) ? "" : gradeOf(r));
+      paintItem(pos, viewRows());
       updateProgress();
+    }
+
+    function applyFilter() {
+      const q = plain($("filterInput").value.trim());
+      [...$("studentList").children].forEach((li, pos) => {
+        li.hidden = q !== "" && !plain(studentName(rows[order[pos]])).includes(q);
+      });
     }
 
     function updateProgress() {
@@ -408,26 +618,75 @@
 
     // ---------- Current student ----------
 
-    function buildFields() {
+    const maxOf = r => {
+      const max = col.maxGrade ? (r.cells[col.maxGrade] || "").trim() : "";
+      return max ? "/ " + max.replace(/\.0+$/, "") : "";
+    };
+
+    // One block of feedback fields per student on screen (several when corrected together)
+    function renderCards(view) {
       const box = $("fields");
-      FIELDS.forEach(f => {
-        const label = document.createElement("label");
-        label.className = "field";
-        label.innerHTML = `<span class="field-title">${f.icon} ${f.title}</span>`;
-        const ta = document.createElement("textarea");
-        ta.id = "field-" + f.key;
-        ta.rows = f.rows;
-        ta.placeholder = f.placeholder;
-        ta.addEventListener("input", () => {
-          const r = rows[order[current]];
-          r.fb[f.key] = ta.value;
-          dirty = true;
-          autoGrow(ta);
-          refreshListItem(current);
+      const grouped = view.length > 1;
+      box.innerHTML = "";
+      box.classList.toggle("cards", grouped);
+
+      const mini = (label, title, onClick) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "mini";
+        b.textContent = label;
+        b.title = title;
+        b.addEventListener("click", onClick);
+        return b;
+      };
+
+      view.forEach((idx, n) => {
+        const r = rows[idx];
+        const card = document.createElement("div");
+        card.className = "card";
+
+        if (grouped) {
+          const head = document.createElement("div");
+          head.className = "card-head";
+          head.innerHTML = `<span class="card-num"></span><strong class="card-name"></strong>` +
+            `<span class="card-grade"><input type="text" inputmode="decimal" autocomplete="off" aria-label="Grade" placeholder="Grade"><span class="muted"></span></span>`;
+          head.querySelector(".card-num").textContent = n + 1;
+          head.querySelector(".card-name").textContent = studentName(r) || "(no name)";
+          head.querySelector(".card-grade span").textContent = maxOf(r);
+          const grade = head.querySelector("input");
+          grade.value = gradeOf(r);
+          grade.addEventListener("input", () => setGrade(idx, grade.value));
+          head.querySelector(".card-grade").appendChild(mini("→ all", "Give this grade to the whole group", () => gradeToAll(idx)));
+          head.appendChild(mini("📋", "Copy this student's feedback HTML", () => copyFeedback(idx)));
+          head.appendChild(mini("✕", "Take this student out of the group", () => leaveGroup(idx)));
+          card.appendChild(head);
+        }
+
+        FIELDS.forEach(f => {
+          const field = document.createElement("div");
+          field.className = "field";
+          const id = `field-${idx}-${f.key}`;
+          field.innerHTML = `<div class="field-title"><label for="${id}">${f.icon} ${f.title}</label></div>`;
+          if (grouped) field.firstChild.appendChild(mini("→ all", "Add this comment to the other students too", () => commentToAll(idx, f.key)));
+          const ta = document.createElement("textarea");
+          ta.id = id;
+          ta.dataset.key = f.key;
+          ta.rows = grouped ? Math.min(f.rows, 3) : f.rows;
+          ta.placeholder = f.placeholder;
+          ta.value = r.fb[f.key];
+          ta.addEventListener("input", () => {
+            r.fb[f.key] = ta.value;
+            dirty = true;
+            autoGrow(ta);
+            refreshListItem(posOf(idx));
+            scheduleDraft();
+          });
+          field.appendChild(ta);
+          card.appendChild(field);
         });
-        label.appendChild(ta);
-        box.appendChild(label);
+        box.appendChild(card);
       });
+      box.querySelectorAll("textarea").forEach(autoGrow);
     }
 
     function autoGrow(ta) {
@@ -437,41 +696,56 @@
 
     function select(pos) {
       if (pos < 0 || pos >= order.length) return;
-      const previous = current;
+      const sameGroup = pos !== current && viewRows().includes(order[pos]);
       current = pos;
-      refreshListItem(previous);
-      refreshListItem(current);
+      paintList();
       renderStudent();
       $("studentList").children[current]?.scrollIntoView({ block: "nearest" });
+      if (sameGroup) focusCard(order[pos]);
+    }
+
+    // Previous / next student, treating students corrected together as one stop
+    function stepTarget(dir) {
+      const view = viewRows();
+      let pos = current + dir;
+      while (pos >= 0 && pos < order.length && view.includes(order[pos])) pos += dir;
+      return pos >= 0 && pos < order.length ? pos : -1;
     }
 
     function renderStudent() {
       const r = rows[order[current]];
       if (!r) return;
-      const name = studentName(r);
+      const view = viewRows();
+      const grouped = view.length > 1;
+      shownRow = productionRow(view);
+      const src = rows[shownRow];
 
-      $("studentName").textContent = name || "(no name)";
+      $("studentName").textContent = view.map(i => studentName(rows[i]) || "(no name)").join(" · ");
+      $("studentName").classList.toggle("grouped", grouped);
       const meta = [];
-      if (!r.submitted) meta.push("❌ Nothing handed in");
-      else if (r.cells[col.submissionDate]) meta.push("Handed in: " + r.cells[col.submissionDate]);
-      if (isResubmitted(r)) meta.push("🔄 Modified since last grade");
+      const date = src.cells[col.submissionDate];
+      if (!src.submitted) meta.push("❌ Nothing handed in");
+      else if (grouped) meta.push("Handed in by " + studentName(src) + (date ? ", " + date : ""));
+      else if (date) meta.push("Handed in: " + date);
+      if (isResubmitted(src)) meta.push("🔄 Modified since last grade");
       $("studentMeta").textContent = meta.join(" · ");
 
+      $("gradeBox").hidden = grouped;
       $("gradeInput").value = gradeOf(r);
-      const max = col.maxGrade ? (r.cells[col.maxGrade] || "").trim() : "";
-      $("maxGrade").textContent = max ? "/ " + max.replace(/\.0+$/, "") : "";
+      $("maxGrade").textContent = maxOf(r);
+      $("groupBtn").textContent = grouped ? "👥 Add a student" : "👥 Correct together";
+      $("columns").classList.toggle("grouped", grouped);
+      $("copyRow").hidden = grouped;
+      $("groupHint").hidden = !grouped;
+      $("productionTitle").textContent = grouped && src.submitted
+        ? "Production handed in by " + studentName(src) : "Student's production";
 
-      FIELDS.forEach(f => {
-        const ta = $("field-" + f.key);
-        ta.value = r.fb[f.key];
-        autoGrow(ta);
-      });
-
-      renderProduction(r);
+      renderCards(view);
+      renderProduction(src);
 
       $("position").textContent = `${current + 1} / ${order.length}`;
-      $("prevBtn").disabled = current === 0;
-      $("nextBtn").disabled = current === order.length - 1;
+      $("prevBtn").disabled = stepTarget(-1) < 0;
+      $("nextBtn").disabled = stepTarget(1) < 0;
       $("workspace").scrollTop = 0;
     }
 
@@ -671,7 +945,7 @@
       });
 
       // Only rebuild players when the set of recordings changes (not on every keystroke)
-      const key = order[current] + "|" + audioLinks.map(([u]) => u).join("|");
+      const key = shownRow + "|" + audioLinks.map(([u]) => u).join("|");
       if (key === lastRecordingKey) return;
       lastRecordingKey = key;
       const rec = $("recordings");
@@ -687,7 +961,7 @@
       rows.filter(r => r.submitted).forEach(r => {
         if (isGradeEmpty(r)) { r.cells[col.grade] = "1"; given++; } else kept++;
       });
-      if (given) dirty = true;
+      if (given) { dirty = true; scheduleDraft(); }
       renderList();
       renderStudent();
       toast(`✅ 1 given to ${given} student${given === 1 ? "" : "s"}` + (kept ? ` · ${kept} already had a grade and kept it` : ""));
@@ -714,7 +988,7 @@
         // Only students on 0 get the message (someone with a real grade may have handed in on paper)
         if (addMessage && Number(gradeOf(r).replace(",", ".")) === 0 && !r.fb.general.trim()) { r.fb.general = message; commented++; }
       });
-      if (given || commented) dirty = true;
+      if (given || commented) { dirty = true; scheduleDraft(); }
       renderList();
       renderStudent();
       toast(`❌ 0 given to ${given} student${given === 1 ? "" : "s"}` + (addMessage ? ` · message added to ${commented}` : ""));
@@ -725,6 +999,10 @@
     // Only students whose grade or feedback changed since the CSV was loaded are exported,
     // so Moodle leaves everyone else untouched (its own export has stripped their feedback HTML).
     function saveCSV() {
+      const noFeedback = rows.filter(r => !isGradeEmpty(r) && !hasFeedback(r)).map(studentName);
+      if (noFeedback.length && !confirm(
+        `${noFeedback.length} student${noFeedback.length === 1 ? " has" : "s have"} a grade but no feedback:\n\n` +
+        noFeedback.join("\n") + "\n\nDownload anyway?")) return;
       const changedRows = rows.filter(r => {
         const feedbackChanged = FIELDS.some(f => r.fb[f.key].trim() !== r.fb0[f.key].trim());
         if (feedbackChanged) r.cells[col.feedback] = buildFeedbackHTML(r.fb);
@@ -782,7 +1060,8 @@
         buildOrder();
         renderList();
         renderStudent();
-        if (zip && csv) toast(`📥 ${rows.length} students loaded.`);
+        if (csv && restoreNote) toast(restoreNote);
+        else if (zip && csv) toast(`📥 ${rows.length} students loaded.`);
         else if (zip) toast("🗜️ Submissions loaded.");
       } else if (zip && !csv) {
         toast("🗜️ ZIP loaded. Now add the CSV.");
@@ -790,8 +1069,6 @@
     }
 
     // ---------- Wiring ----------
-
-    buildFields();
 
     $("chooseBtn").addEventListener("click", () => $("fileInput").click());
     $("addFilesBtn").addEventListener("click", () => $("fileInput").click());
@@ -805,25 +1082,46 @@
       if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
     });
 
-    $("gradeInput").addEventListener("input", e => {
-      rows[order[current]].cells[col.grade] = e.target.value;
-      dirty = true;
-      refreshListItem(current);
-    });
+    $("gradeInput").addEventListener("input", e => setGrade(order[current], e.target.value));
 
     $("production").addEventListener("input", () => {
-      studentEditMap[studentName(rows[order[current]])] = $("production").innerHTML;
+      studentEditMap[studentName(rows[shownRow])] = $("production").innerHTML;
       renderLinksAndRecordings();
     });
 
-    $("copyFeedbackBtn").addEventListener("click", copyFeedback);
-    $("prevBtn").addEventListener("click", () => select(current - 1));
-    $("nextBtn").addEventListener("click", () => select(current + 1));
+    $("copyFeedbackBtn").addEventListener("click", () => copyFeedback(order[current]));
+    $("prevBtn").addEventListener("click", () => select(stepTarget(-1)));
+    $("nextBtn").addEventListener("click", () => select(stepTarget(1)));
     document.addEventListener("keydown", e => {
-      if (!e.altKey || $("app").hidden || $("zeroDialog").open) return;
-      if (e.key === "ArrowDown") { e.preventDefault(); select(current + 1); }
-      if (e.key === "ArrowUp") { e.preventDefault(); select(current - 1); }
+      // AltGr (Ctrl + Alt on Windows) types characters on many keyboards, so it's left alone
+      if (!e.altKey || e.ctrlKey || e.getModifierState("AltGraph") || $("app").hidden || $("zeroDialog").open) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); select(stepTarget(1)); }
+      if (e.key === "ArrowUp") { e.preventDefault(); select(stepTarget(-1)); }
+      // Alt + 1, 2, 3… : same field, other student of the group
+      const digit = /^Digit([1-9])$/.exec(e.code);
+      const view = viewRows();
+      if (digit && view.length > 1 && view[digit[1] - 1] !== undefined) {
+        e.preventDefault();
+        focusCard(view[digit[1] - 1], document.activeElement?.dataset?.key);
+      }
     });
+
+    $("groupBtn").addEventListener("click", () => {
+      $("filterInput").focus();
+      toast(`👥 Click + next to the students who worked with ${studentName(rows[order[current]])} (or Ctrl + click their name).`);
+    });
+    $("filterInput").addEventListener("input", applyFilter);
+    $("filterInput").addEventListener("keydown", e => {
+      if (e.key === "Escape") { e.target.value = ""; applyFilter(); return; }
+      if (e.key !== "Enter" || !e.target.value.trim()) return;
+      e.preventDefault();
+      const pos = [...$("studentList").children].findIndex(li => !li.hidden);
+      if (pos < 0) return;
+      e.target.value = "";
+      applyFilter();
+      if (e.shiftKey) toggleMate(order[pos]); else select(pos);
+    });
+    $("resetBtn").addEventListener("click", startOver);
 
     $("oneAllBtn").addEventListener("click", giveOneToHandedIn);
     $("zeroMissingBtn").addEventListener("click", openZeroDialog);
@@ -840,7 +1138,9 @@
       toastTimer = setTimeout(() => t.classList.remove("show"), 4500);
     }
 
+    window.addEventListener("pagehide", saveDraft);
     window.addEventListener("beforeunload", e => {
+      saveDraft();
       if (dirty) {
         e.preventDefault();
         e.returnValue = "You have unsaved changes. Are you sure you want to leave?";
